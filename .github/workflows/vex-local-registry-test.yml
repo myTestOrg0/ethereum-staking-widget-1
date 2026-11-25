@@ -1,0 +1,133 @@
+# TEST: can an image-scoped (Harbor-style) VEX statement match in CI if the image is
+# pushed to a registry on the runner?
+#
+# Statement (.github/vex-test/oci-staking-widget.json):
+#   product  pkg:oci/staking-widget?repository_url=registry.prod.k8s-prod.org/team-si/staking-widget
+#   subcomponent pkg:npm/next@12.3.7, GHSA-2xp9-vwfh-vxw4 + GHSA-2464-fhr4-w9xw -> not_affected
+#
+# Same image, five ways to scan it. Each step prints the root purl Trivy built and the table.
+#   A. docker save -> --input (today's release workflow)                  expect: no root purl, NOT suppressed
+#   B. pushed to localhost:5000/team-si/staking-widget                     expect: wrong repository_url, NOT suppressed
+#   C. registry.prod.k8s-prod.org aliased to 127.0.0.1 (/etc/hosts, TLS), scanned via docker daemon
+#                                                                          expect: suppressed
+#   D. same alias, scanned from the registry (remote)                      expect: suppressed
+#   E. same alias, image pushed under another name (team-si/other-app)   expect: NOT suppressed
+name: VEX local registry test
+
+on:
+  push:
+    branches: [test/vex-local-registry]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TRIVY_VERSION: 0.76.2
+  TRIVY_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+  VEX: .github/vex-test/oci-staking-widget.json
+  PROD_HOST: registry.prod.k8s-prod.org
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare - build image, install Trivy
+        run: |
+          docker build -q -t local-build:test .
+          curl -fsSLo "$RUNNER_TEMP/trivy.tgz" "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  $RUNNER_TEMP/trivy.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/trivy.tgz" -C "$RUNNER_TEMP" trivy
+          sudo install -m 0755 "$RUNNER_TEMP/trivy" /usr/local/bin/trivy
+          trivy image --download-db-only -q
+          cat > scan.sh <<'SH'
+          # usage: scan.sh <name> <trivy image args...>
+          set -uo pipefail
+          name=$1; shift
+          trivy image -q --skip-db-update --scanners vuln --severity CRITICAL --format cyclonedx -o "bom-$name.json" "$@"
+          echo "ROOT PURL: $(jq -r '.metadata.component.purl // "none (no RepoDigest)"' "bom-$name.json")"
+          rc=0
+          trivy image -q --skip-db-update --scanners vuln --severity CRITICAL --vex "$VEX" --show-suppressed \
+            --exit-code 1 --format json -o "r-$name.json" "$@" || rc=$?
+          trivy convert --format table --show-suppressed "r-$name.json" | sed -n '/Node.js/,$p'
+          echo "CRITICAL gate exit code: $rc"; echo "$rc" > "rc-$name"
+          SH
+
+      - name: "A. docker save -> --input (today)"
+        run: |
+          docker save -o image.tar local-build:test
+          bash scan.sh A --input image.tar
+
+      - name: "B. local registry, pushed as localhost:5000/team-si/staking-widget"
+        run: |
+          docker run -d --name reg5000 -p 5000:5000 registry:2
+          sleep 2
+          docker tag local-build:test localhost:5000/team-si/staking-widget:test
+          docker push -q localhost:5000/team-si/staking-widget:test
+          bash scan.sh B --image-src remote --insecure localhost:5000/team-si/staking-widget:test
+
+      - name: "Prepare - alias registry.prod.k8s-prod.org to a registry on 127.0.0.1:443"
+        run: |
+          mkdir certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=$PROD_HOST" \
+            -addext "subjectAltName=DNS:$PROD_HOST" -keyout certs/tls.key -out certs/tls.crt 2>/dev/null
+          echo "127.0.0.1 $PROD_HOST" | sudo tee -a /etc/hosts
+          # docker trusts a per-registry CA without a daemon restart
+          sudo mkdir -p "/etc/docker/certs.d/$PROD_HOST"
+          sudo cp certs/tls.crt "/etc/docker/certs.d/$PROD_HOST/ca.crt"
+          docker run -d --name reg443 -p 443:443 -v "$PWD/certs:/certs:ro" \
+            -e REGISTRY_HTTP_ADDR=0.0.0.0:443 -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/tls.crt \
+            -e REGISTRY_HTTP_TLS_KEY=/certs/tls.key registry:2
+          sleep 2
+          getent hosts "$PROD_HOST"
+          docker tag local-build:test "$PROD_HOST/team-si/staking-widget:test"
+          docker push "$PROD_HOST/team-si/staking-widget:test" | tail -1
+          echo "RepoDigests (docker inspect): $(docker inspect -f '{{json .RepoDigests}}' "$PROD_HOST/team-si/staking-widget:test")"
+
+      - name: "C. alias, scanned via docker daemon"
+        run: bash scan.sh C --image-src docker "$PROD_HOST/team-si/staking-widget:test"
+
+      - name: "D. alias, scanned from the registry (remote)"
+        env:
+          SSL_CERT_FILE: ${{ github.workspace }}/certs/tls.crt
+        run: bash scan.sh D --image-src remote "$PROD_HOST/team-si/staking-widget:test"
+
+      - name: "E. alias, same image under another name (team-si/other-app)"
+        env:
+          SSL_CERT_FILE: ${{ github.workspace }}/certs/tls.crt
+        run: |
+          # pushed only now, so steps C/D saw a single RepoDigest
+          docker tag local-build:test "$PROD_HOST/team-si/other-app:test"
+          docker push "$PROD_HOST/team-si/other-app:test" | tail -1
+          bash scan.sh E --image-src remote "$PROD_HOST/team-si/other-app:test"
+
+      - name: Result
+        run: |
+          python3 - <<'PY'
+          import json, os
+          cases = {"A": ("docker save -> --input (today)", False),
+                   "B": ("localhost:5000/team-si/staking-widget", False),
+                   "C": ("alias registry.prod.../team-si/staking-widget, docker daemon", True),
+                   "D": ("alias registry.prod.../team-si/staking-widget, remote", True),
+                   "E": ("alias registry.prod.../team-si/other-app, remote", False)}
+          rows = ["| case | root purl | GHSA-2xp9 / GHSA-2464 | gate | expected |", "|---|---|---|---|---|"]
+          ok = True
+          for n, (label, want) in cases.items():
+              purl = json.load(open(f"bom-{n}.json"))["metadata"]["component"].get("purl", "none")
+              sup = {m["Finding"]["VulnerabilityID"] for r in json.load(open(f"r-{n}.json")).get("Results") or []
+                     for m in r.get("ExperimentalModifiedFindings") or []}
+              both = {"GHSA-2xp9-vwfh-vxw4", "GHSA-2464-fhr4-w9xw"} <= sup
+              rc = int(open(f"rc-{n}").read())
+              good = both == want
+              ok &= good
+              rows.append(f"| {n}. {label} | `{purl}` | {'🟢 suppressed' if both else '🔴 reported'} | "
+                          f"{'PASS' if rc == 0 else 'FAIL'} | {'✅' if good else '❌'} |")
+          txt = "\n".join(["## Image-scoped VEX in CI via a local registry", ""] + rows + ["", f"**TEST: {'PASS' if ok else 'FAIL'}**"])
+          print(txt)
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(txt + "\n")
+          PY
