@@ -1,0 +1,115 @@
+# TEST: option B end to end. ghcr.io stands in for the prod registry (no Harbor in the test org).
+#
+#   1. alias ghcr.io -> registry on 127.0.0.1 (/etc/hosts + self-signed cert in certs.d)
+#   2. push ghcr.io/mytestorg0/vex-alias-test:<run>  -> lands in the LOCAL registry
+#   3. scan it from there with an image VEX statement for ghcr.io/mytestorg0/vex-alias-test -> GHSA hidden
+#   4. remove the alias (hosts line, certs.d, local registry)
+#   5. docker login + push the same tag -> lands in the REAL ghcr.io; digest must be the same
+#   6. scan from the real ghcr.io with the same VEX -> same image PURL, GHSA hidden again
+name: VEX alias then real push test
+
+on:
+  push:
+    branches: [test/vex-options]
+    paths: [.github/workflows/vex-alias-push-test.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  TRIVY_VERSION: 0.76.2
+  TRIVY_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+  REG_HOST: ghcr.io
+  IMAGE: ghcr.io/mytestorg0/vex-alias-test
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "0. Build image, install Trivy, write VEX repository"
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP/t"; mkdir -p "$T/cache"; echo "T=$T" >> "$GITHUB_ENV"
+          echo "REF=$IMAGE:${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
+          docker build -q -t local-build:demo .
+          curl -fsSLo "$T/trivy.tgz" "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  $T/trivy.tgz" | sha256sum -c -
+          tar xzf "$T/trivy.tgz" -C "$T" trivy && sudo install -m 0755 "$T/trivy" /usr/local/bin/trivy
+          trivy image --cache-dir "$T/cache" --download-db-only -q
+          # VEX repository "internal": one image statement for ghcr.io/mytestorg0/vex-alias-test
+          purl='pkg:oci/vex-alias-test?repository_url=ghcr.io%2Fmytestorg0%2Fvex-alias-test'
+          r="$T/cache/vex/repositories/internal/0.1"; mkdir -p "$r/oci"
+          jq -n --arg p "$purl" '{updated_at:"2026-11-26T00:00:00Z",packages:[{id:$p,location:"oci/vex.json",format:"openvex"}]}' > "$r/index.json"
+          jq -n --arg p "$purl" '{"@context":"https://openvex.dev/ns/v0.2.0","@id":"test","author":"TEST","timestamp":"2026-11-26T00:00:00Z","version":1,
+            statements:[{vulnerability:{name:"GHSA-2xp9-vwfh-vxw4"},products:[{"@id":$p,subcomponents:[{"@id":"pkg:npm/next@12.3.7"}]}],
+            status:"not_affected",justification:"vulnerable_code_not_in_execute_path"}]}' > "$r/oci/vex.json"
+          mkdir -p "$HOME/.trivy/vex"
+          printf 'repositories:\n  - name: internal\n    url: https://github.com/myTestOrg0/vex-scope-demo\n    enabled: true\n' > "$HOME/.trivy/vex/repository.yaml"
+          echo "VEX statement product: $purl  (subcomponent pkg:npm/next@12.3.7, GHSA-2xp9-vwfh-vxw4)"
+          cat > "$T/scan.sh" <<'SH'
+          set -euo pipefail
+          trivy image -q --cache-dir "$T/cache" --skip-db-update --scanners vuln --format cyclonedx -o "$T/bom.json" --image-src remote "$1"
+          echo "Image PURL built by Trivy: $(jq -r '.metadata.component.purl' "$T/bom.json")"
+          trivy image -q --cache-dir "$T/cache" --skip-db-update --scanners vuln --show-suppressed --format json -o "$T/r.json" \
+            --image-src remote --vex repo --skip-vex-repo-update "$1"
+          jq -r '[.Results[]? | (.Vulnerabilities[]? | select(.VulnerabilityID=="GHSA-2xp9-vwfh-vxw4") | "GHSA-2xp9-vwfh-vxw4 REPORTED"),
+                  (.ExperimentalModifiedFindings[]? | select(.Finding.VulnerabilityID=="GHSA-2xp9-vwfh-vxw4") | "GHSA-2xp9-vwfh-vxw4 HIDDEN by \(.Source)")] | .[]' "$T/r.json"
+          SH
+
+      - name: "1. Alias ghcr.io to a registry on 127.0.0.1"
+        run: |
+          set -euo pipefail
+          echo "Before: ghcr.io resolves to $(getent hosts "$REG_HOST" | awk '{print $1}' | head -1)"
+          mkdir -p "$T/certs"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=$REG_HOST" \
+            -addext "subjectAltName=DNS:$REG_HOST" -keyout "$T/certs/tls.key" -out "$T/certs/tls.crt" 2>/dev/null
+          echo "127.0.0.1 $REG_HOST # vex-alias" | sudo tee -a /etc/hosts >/dev/null
+          sudo mkdir -p "/etc/docker/certs.d/$REG_HOST" && sudo cp "$T/certs/tls.crt" "/etc/docker/certs.d/$REG_HOST/ca.crt"
+          docker run -d -q --name reg443 -p 443:443 -v "$T/certs:/certs:ro" -e REGISTRY_HTTP_ADDR=0.0.0.0:443 \
+            -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/tls.crt -e REGISTRY_HTTP_TLS_KEY=/certs/tls.key registry:2 >/dev/null
+          sleep 2
+          echo "After:  ghcr.io resolves to $(getent hosts "$REG_HOST" | awk '{print $1}' | head -1)"
+
+      - name: "2. Push while aliased -> goes to the LOCAL registry"
+        run: |
+          set -euo pipefail
+          docker tag local-build:demo "$REF"
+          docker push -q "$REF"
+          d=$(docker inspect -f '{{index .RepoDigests 0}}' "$REF"); echo "Digest after local push: ${d#*@}"; echo "LOCAL_DIGEST=${d#*@}" >> "$GITHUB_ENV"
+          echo "Local registry catalog: $(curl -fsS --cacert "$T/certs/tls.crt" "https://$REG_HOST/v2/_catalog")"
+
+      - name: "3. Scan from the LOCAL registry"
+        env:
+          SSL_CERT_FILE: ${{ runner.temp }}/t/certs/tls.crt
+        run: bash "$T/scan.sh" "$REF"
+
+      - name: "4. Remove the alias"
+        run: |
+          set -euo pipefail
+          sudo sed -i '/# vex-alias$/d' /etc/hosts
+          sudo rm -rf "/etc/docker/certs.d/$REG_HOST"
+          docker rm -f reg443 >/dev/null
+          echo "ghcr.io resolves to $(getent hosts "$REG_HOST" | awk '{print $1}' | head -1)"
+          grep -c 'vex-alias' /etc/hosts || echo "no alias line left in /etc/hosts"
+
+      - name: "5. Real push to ghcr.io"
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$TOKEN" | docker login "$REG_HOST" -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+          docker push -q "$REF"
+          remote=$(docker buildx imagetools inspect "$REF" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "Digest in the real ghcr.io: $remote"
+          echo "Digest from the local push: $LOCAL_DIGEST"
+          [ "$remote" = "$LOCAL_DIGEST" ] && echo "SAME DIGEST: the scanned image is exactly the pushed image" || { echo "DIGEST MISMATCH"; exit 1; }
+
+      - name: "6. Scan from the real ghcr.io with the same VEX"
+        run: bash "$T/scan.sh" "$REF"
