@@ -1,0 +1,16 @@
+# TEST: VEX whitelisting options A-E on this repository's image.
+name: VEX options demo
+
+on:
+  push:
+    branches: [test/vex-options]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  own-image:
+    uses: myTestOrg0/actions/.github/workflows/k8s-trivy-vex-options-demo.yml@feat/vex-scope-filter
+    with:
+      image_name: staking-widget
